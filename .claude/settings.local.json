@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where make:*)",
+      "Bash(where gcc:*)",
+      "Bash(where:*)",
+      "Bash(C:msys64ucrt64binmake.exe --version)",
+      "Bash(dir C:msys64ucrt64bin*make*)",
+      "Bash(C:msys64usrbinmake.exe --version)",
+      "Bash(dir C:msys64usrbin*make*)",
+      "Bash(C:msys64msys2_shell.cmd -defterm -here -no-start -ucrt64 -c \"echo test\")",
+      "Bash(wsl --list --verbose:*)",
+      "Bash(wsl -d Ubuntu -- bash -c \"which make && which mpicxx && which python3 && dpkg -l | grep -E ''liblapack|libblas|libmetis'' | head -10\")",
+      "Bash(wsl -d Ubuntu -- bash -c \"sudo apt-get update && sudo apt-get install -y liblapack-dev libblas-dev libmetis-dev\")",
+      "Bash(wsl -d Ubuntu -- bash -c \"wslpath ''c:/cplusplus/ntop/tacs''\")",
+      "Bash(wsl -d Ubuntu -- bash -c \"cd /mnt/c/cplusplus/ntop/tacs && mkdir -p lib && ls -la lib/\":*)",
+      "Bash(wsl -d Ubuntu -- bash -c \"cd /mnt/c/cplusplus/ntop/tacs && make 2>&1\":*)",
+      "Bash(wsl -d Ubuntu -- bash -c:*)",
+      "Bash(findstr:*)",
+      "Bash(timeout:*)",
+      "Bash(powershell -Command \"Install-Module posh-git -Scope CurrentUser -Force\")",
+      "Bash(powershell -Command \"$profilePath = $PROFILE; Write-Host $profilePath\")",
+      "Bash(powershell -Command \"Write-Host $PROFILE\")",
+      "Bash(powershell:*)"
+    ]
+  }
+}
