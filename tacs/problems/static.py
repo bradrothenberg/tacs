@@ -22,6 +22,7 @@ import pyNastran.bdf as pn
 
 import tacs.TACS
 import tacs.elements
+import tacs.functions
 import tacs.solvers
 from tacs.problems.base import TACSProblem
 
@@ -812,6 +813,355 @@ class StaticProblem(TACSProblem):
             Factor to scale the BDF loads by before adding to problem.
         """
         self._addLoadFromBDF(self.F, self.auxElems, loadID, scale)
+
+    ####### Inertial relief methods ########
+
+    def _computeMassProperties(self):
+        """
+        Compute mass properties of the structure using TACS functions.
+
+        Returns
+        -------
+        mass : float
+            Total structural mass
+        cg : numpy.ndarray
+            Center of gravity coordinates [x, y, z]
+        inertia : numpy.ndarray
+            3x3 inertia tensor about the center of gravity
+        """
+        # Make sure assembler variables are up-to-date
+        self._updateAssemblerVars()
+
+        # Create function handles for mass properties
+        mass_func = tacs.functions.StructuralMass(self.assembler)
+
+        # Center of mass in each direction
+        cgx_func = tacs.functions.CenterOfMass(
+            self.assembler, direction=[1.0, 0.0, 0.0]
+        )
+        cgy_func = tacs.functions.CenterOfMass(
+            self.assembler, direction=[0.0, 1.0, 0.0]
+        )
+        cgz_func = tacs.functions.CenterOfMass(
+            self.assembler, direction=[0.0, 0.0, 1.0]
+        )
+
+        # Moments of inertia (6 unique components for symmetric tensor)
+        # Note: TACS uses negative sign convention for products of inertia
+        ixx_func = tacs.functions.MomentOfInertia(
+            self.assembler,
+            direction1=[1.0, 0.0, 0.0],
+            direction2=[1.0, 0.0, 0.0],
+            aboutCM=True,
+        )
+        ixy_func = tacs.functions.MomentOfInertia(
+            self.assembler,
+            direction1=[1.0, 0.0, 0.0],
+            direction2=[0.0, 1.0, 0.0],
+            aboutCM=True,
+        )
+        ixz_func = tacs.functions.MomentOfInertia(
+            self.assembler,
+            direction1=[1.0, 0.0, 0.0],
+            direction2=[0.0, 0.0, 1.0],
+            aboutCM=True,
+        )
+        iyy_func = tacs.functions.MomentOfInertia(
+            self.assembler,
+            direction1=[0.0, 1.0, 0.0],
+            direction2=[0.0, 1.0, 0.0],
+            aboutCM=True,
+        )
+        iyz_func = tacs.functions.MomentOfInertia(
+            self.assembler,
+            direction1=[0.0, 1.0, 0.0],
+            direction2=[0.0, 0.0, 1.0],
+            aboutCM=True,
+        )
+        izz_func = tacs.functions.MomentOfInertia(
+            self.assembler,
+            direction1=[0.0, 0.0, 1.0],
+            direction2=[0.0, 0.0, 1.0],
+            aboutCM=True,
+        )
+
+        # Evaluate all functions at once
+        all_funcs = [
+            mass_func,
+            cgx_func,
+            cgy_func,
+            cgz_func,
+            ixx_func,
+            ixy_func,
+            ixz_func,
+            iyy_func,
+            iyz_func,
+            izz_func,
+        ]
+        values = self.assembler.evalFunctions(all_funcs)
+
+        # Extract results
+        mass = np.real(values[0])
+        cg = np.array([np.real(values[1]), np.real(values[2]), np.real(values[3])])
+
+        # Build symmetric 3x3 inertia tensor
+        # Note: TACS MomentOfInertia returns negative products of inertia,
+        # so we negate them to get standard convention
+        ixx = np.real(values[4])
+        ixy = -np.real(values[5])  # Negate product of inertia
+        ixz = -np.real(values[6])  # Negate product of inertia
+        iyy = np.real(values[7])
+        iyz = -np.real(values[8])  # Negate product of inertia
+        izz = np.real(values[9])
+
+        inertia = np.array([[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]])
+
+        return mass, cg, inertia
+
+    def _computeAppliedLoadResultant(self, refPoint=None):
+        """
+        Compute total force and moment resultant from applied nodal loads.
+
+        Parameters
+        ----------
+        refPoint : numpy.ndarray, optional
+            Reference point about which to compute moments.
+            Default is the origin [0, 0, 0].
+
+        Returns
+        -------
+        totalForce : numpy.ndarray
+            Total applied force [Fx, Fy, Fz]
+        totalMoment : numpy.ndarray
+            Total applied moment [Mx, My, Mz] about reference point
+        """
+        if refPoint is None:
+            refPoint = np.zeros(3)
+        refPoint = np.atleast_1d(refPoint).astype(float)
+
+        # Get local arrays
+        F_array = self.F.getArray()
+        Xpts_array = self.Xpts.getArray()
+
+        vpn = self.getVarsPerNode()
+        nnodes = self.getNumOwnedNodes()
+
+        # Local summations
+        local_force = np.zeros(3)
+        local_moment = np.zeros(3)
+
+        for i in range(nnodes):
+            # Get force components (first 3 DOFs are translational)
+            f = np.zeros(3)
+            for j in range(min(3, vpn)):
+                f[j] = np.real(F_array[i * vpn + j])
+
+            # Get node coordinates
+            r = np.array(
+                [
+                    np.real(Xpts_array[i * 3]),
+                    np.real(Xpts_array[i * 3 + 1]),
+                    np.real(Xpts_array[i * 3 + 2]),
+                ]
+            )
+
+            # Sum forces
+            local_force += f
+
+            # Compute moment contribution: (r - refPoint) x F
+            r_rel = r - refPoint
+            local_moment += np.cross(r_rel, f)
+
+            # Add explicit moment contributions if vpn >= 6
+            if vpn >= 6:
+                m = np.zeros(3)
+                for j in range(3):
+                    m[j] = np.real(F_array[i * vpn + 3 + j])
+                local_moment += m
+
+        # Global reduction across all processors
+        from mpi4py import MPI
+
+        total_force = np.zeros(3)
+        total_moment = np.zeros(3)
+        self.comm.Allreduce(local_force, total_force, op=MPI.SUM)
+        self.comm.Allreduce(local_moment, total_moment, op=MPI.SUM)
+
+        return total_force, total_moment
+
+    def _computeNodalMass(self, totalMass):
+        """
+        Compute lumped mass at each node for inertial relief force application.
+
+        This uses a simple approximation where the total mass is distributed
+        uniformly across all nodes in the model.
+
+        Parameters
+        ----------
+        totalMass : float
+            Total structural mass
+
+        Returns
+        -------
+        nodalMass : numpy.ndarray
+            Array of lumped mass values for each local node
+        """
+        # Get total number of nodes across all processors
+        from mpi4py import MPI
+
+        local_nnodes = self.getNumOwnedNodes()
+        total_nnodes = self.comm.allreduce(local_nnodes, op=MPI.SUM)
+
+        # Simple uniform distribution
+        mass_per_node = totalMass / total_nnodes
+
+        # Return array of nodal masses for local nodes
+        return np.full(local_nnodes, mass_per_node)
+
+    def applyInertialRelief(self, dof=6):
+        """
+        Apply inertial relief loads to create a self-equilibrated load system.
+
+        For a free-free (unconstrained) structure, this method computes the
+        rigid body acceleration that would result from the applied loads,
+        then applies corresponding d'Alembert (inertia) forces to balance
+        the system. This enables static analysis of structures without
+        physical supports (e.g., aircraft in flight, spacecraft).
+
+        Parameters
+        ----------
+        dof : int, optional
+            Degrees of freedom for inertial relief:
+            - 3: Translation only (uniform linear acceleration)
+            - 6: Full 6-DOF (translation + rotation)
+            Default is 6.
+
+        Returns
+        -------
+        reliefInfo : dict
+            Dictionary containing computed inertial relief information:
+            - 'mass': Total structural mass
+            - 'cg': Center of gravity [x, y, z]
+            - 'inertia': 3x3 inertia tensor about CG
+            - 'totalForce': Sum of applied forces [Fx, Fy, Fz]
+            - 'totalMoment': Sum of applied moments about CG [Mx, My, Mz]
+            - 'linearAccel': Computed linear acceleration [ax, ay, az]
+            - 'angularAccel': Computed angular acceleration [alpha_x, alpha_y, alpha_z]
+
+        Notes
+        -----
+        This method should be called AFTER all other loads have been applied
+        and BEFORE calling solve(). The inertial relief loads are added to
+        the force vector and will be automatically included when solve() is called.
+
+        For structures with boundary conditions (constraints), a warning will
+        be issued since inertial relief assumes a free-free condition.
+
+        Examples
+        --------
+        >>> problem = fea.createStaticProblem("flight_loads")
+        >>> problem.addLoadToNodes([wing_tip], [0, 0, -1000])
+        >>> relief = problem.applyInertialRelief(dof=6)
+        >>> print(f"Linear acceleration: {relief['linearAccel']}")
+        >>> problem.solve()
+        """
+        if dof not in [3, 6]:
+            raise self._TACSError("dof must be 3 (translation only) or 6 (full)")
+
+        # Compute mass properties
+        mass, cg, inertia = self._computeMassProperties()
+
+        if mass <= 0.0:
+            raise self._TACSError(
+                "Total mass is zero or negative. Cannot apply inertial relief."
+            )
+
+        # Compute total applied load resultant about CG
+        total_force, total_moment = self._computeAppliedLoadResultant(refPoint=cg)
+
+        # Check if any loads have been applied
+        force_norm = np.linalg.norm(total_force)
+        moment_norm = np.linalg.norm(total_moment)
+        if force_norm < 1e-16 and moment_norm < 1e-16:
+            self._TACSWarning(
+                "No significant loads detected. Inertial relief will have no effect."
+            )
+
+        # Compute linear acceleration: a = F / m
+        linear_accel = total_force / mass
+
+        # Compute angular acceleration for 6-DOF
+        if dof == 6:
+            # Solve: I @ alpha = M
+            try:
+                # Check condition number
+                cond = np.linalg.cond(inertia)
+                if cond > 1e12:
+                    self._TACSWarning(
+                        f"Inertia tensor is poorly conditioned (cond={cond:.2e}). "
+                        "This may occur for 2D problems. Falling back to 3-DOF relief."
+                    )
+                    angular_accel = np.zeros(3)
+                    dof = 3  # Fall back to 3-DOF
+                else:
+                    angular_accel = np.linalg.solve(inertia, total_moment)
+            except np.linalg.LinAlgError:
+                self._TACSWarning(
+                    "Inertia tensor is singular. Falling back to 3-DOF relief."
+                )
+                angular_accel = np.zeros(3)
+                dof = 3  # Fall back to 3-DOF
+        else:
+            angular_accel = np.zeros(3)
+
+        # Compute nodal masses for force distribution
+        nodal_mass = self._computeNodalMass(mass)
+
+        # Get node coordinates
+        Xpts_array = self.Xpts.getArray()
+        nnodes = self.getNumOwnedNodes()
+        vpn = self.getVarsPerNode()
+
+        # Compute and apply relief forces at each node
+        # Relief force = m_node * a_node where a_node = a + alpha x (r - cg)
+        relief_forces = np.zeros(nnodes * vpn, dtype=self.dtype)
+
+        for i in range(nnodes):
+            # Get node position
+            r = np.array(
+                [
+                    np.real(Xpts_array[i * 3]),
+                    np.real(Xpts_array[i * 3 + 1]),
+                    np.real(Xpts_array[i * 3 + 2]),
+                ]
+            )
+
+            # Compute acceleration at this node
+            r_rel = r - cg
+            a_node = linear_accel + np.cross(angular_accel, r_rel)
+
+            # Compute relief force: F = -m * a (d'Alembert force)
+            # The negative sign creates the balancing inertia force
+            f_relief = -nodal_mass[i] * a_node
+
+            # Add to relief forces array (translational DOFs only)
+            for j in range(min(3, vpn)):
+                relief_forces[i * vpn + j] = f_relief[j]
+
+        # Add relief forces to the force vector
+        F_array = self.F.getArray()
+        F_array[:] = F_array[:] + relief_forces[:]
+
+        # Return relief information
+        return {
+            "mass": mass,
+            "cg": cg,
+            "inertia": inertia,
+            "totalForce": total_force,
+            "totalMoment": total_moment,
+            "linearAccel": linear_accel,
+            "angularAccel": angular_accel,
+        }
 
     ####### Static solver methods ########
 
